@@ -3,104 +3,111 @@
  */
 package akka.util
 import java.util.Arrays
-
 import akka.annotation.InternalApi
-
 import scala.annotation.tailrec
 
 /**
  * INTERNAL API
  */
 @InternalApi private[akka] object ImmutableIntMap {
-  val empty: ImmutableIntMap =
-    new ImmutableIntMap(Array.emptyIntArray, Array.empty)
-
-  private final val MaxScanLength = 10
+  val empty: ImmutableIntMap = new ImmutableIntMap(Array.emptyLongArray)
 }
 
 /**
  * INTERNAL API
- * Specialized Map for primitive `Int` keys to avoid allocations (boxing).
- * Keys and values are backed by arrays and lookup is performed with binary
- * search. It's intended for rather small (<1000) maps.
+ * Specialized Map for primitive `Int` keys and values to avoid allocations (boxing).
+ * Keys and values are encoded in a single Long array and does copy-on-write with no
+ * structural sharing, it's intended for rather small maps (<1000 elements).
  */
-@InternalApi private[akka] final class ImmutableIntMap private (
-  private val keys: Array[Int], private val values: Array[Int]) {
+@InternalApi private[akka] final class ImmutableIntMap private (private final val kvs: Array[Long]) {
 
-  final val size: Int = keys.length
+  final def size: Int = kvs.length
+
+  private[this] final def indexForKey(key: Int): Int = {
+    @tailrec def find(lo: Int, hi: Int): Int =
+      if (lo <= hi) {
+        val at = (lo + hi) >>> 1
+        val eKey = keyFromEntry(kvs(at))
+        if (eKey < key) find(at + 1, hi)
+        else if (eKey > key) find(lo, at - 1)
+        else at
+      } else -(lo + 1)
+    find(0, size - 1)
+  }
+
+  private[this] final def entry(key: Int, value: Int): Long = (key.toLong << 32) | (value & 0xffffffffL)
+  private[this] final def keyFromEntry(entry: Long): Int = (entry >> 32).toInt // get rid of value bits
+  private[this] final def valueFromEntry(entry: Long): Int = entry.toInt //cast away key bits
+
+  /**
+   * Worst case `O(log n)`, allocation free.
+   * Will return Int.MinValue if not found, so beware of storing Int.MinValues
+   */
+  final def get(key: Int): Int = {
+    @tailrec def find(lo: Int, hi: Int): Int =
+      if (lo <= hi) {
+        val at = (lo + hi) >>> 1
+        val e = kvs(at)
+        val eKey = keyFromEntry(e)
+        if (eKey < key) find(at + 1, hi)
+        else if (eKey > key) find(lo, at - 1)
+        else valueFromEntry(e)
+      } else Int.MinValue // MinValue is equivalent of Not Found
+    find(0, size - 1)
+  }
 
   /**
    * Worst case `O(log n)`, allocation free.
    */
-  def get(key: Int): Int = {
-    val i = Arrays.binarySearch(keys, key)
-    if (i >= 0) values(i)
-    else Int.MinValue // cant use null, cant use OptionVal, other option is to throw an exception...
-  }
+  final def contains(key: Int): Boolean = indexForKey(key) >= 0
 
-  /**
-   * Worst case `O(log n)`, allocation free.
-   */
-  def contains(key: Int): Boolean = {
-    Arrays.binarySearch(keys, key) >= 0
-  }
-
-  def updateIfAbsent(key: Int, value: ⇒ Int): ImmutableIntMap = {
-    if (contains(key))
-      this
-    else
-      updated(key, value)
-  }
+  final def updateIfAbsent(key: Int, value: ⇒ Int): ImmutableIntMap =
+    if (size == 0) new ImmutableIntMap(Array(entry(key, value)))
+    else {
+      val i = indexForKey(key)
+      if (i >= 0) this
+      else insert(key, value, i)
+    }
 
   /**
    * Worst case `O(log n)`, creates new `ImmutableIntMap`
-   * with copies of the internal arrays for the keys and
-   * values.
+   * with the given key with the given value.
    */
-  def updated(key: Int, value: Int): ImmutableIntMap = {
-    if (size == 0)
-      new ImmutableIntMap(Array(key), Array(value))
+  final def updated(key: Int, value: Int): ImmutableIntMap =
+    if (size == 0) new ImmutableIntMap(Array(entry(key, value)))
     else {
-      val i = Arrays.binarySearch(keys, key)
-      if (i >= 0) {
-        // existing key, replace value
-        val newValues = new Array[Int](values.length)
-        System.arraycopy(values, 0, newValues, 0, values.length)
-        newValues(i) = value
-        new ImmutableIntMap(keys, newValues)
-      } else {
-        // insert the entry at the right position, and keep the arrays sorted
-        val j = -(i + 1)
-        val newKeys = new Array[Int](size + 1)
-        System.arraycopy(keys, 0, newKeys, 0, j)
-        newKeys(j) = key
-        System.arraycopy(keys, j, newKeys, j + 1, keys.length - j)
-
-        val newValues = new Array[Int](size + 1)
-        System.arraycopy(values, 0, newValues, 0, j)
-        newValues(j) = value
-        System.arraycopy(values, j, newValues, j + 1, values.length - j)
-
-        new ImmutableIntMap(newKeys, newValues)
-      }
+      val i = indexForKey(key)
+      if (i >= 0) update(key, value, i)
+      else insert(key, value, i)
     }
+
+  private[this] final def update(key: Int, value: Int, index: Int): ImmutableIntMap = {
+    val newKvs = new Array[Long](size)
+    System.arraycopy(kvs, 0, newKvs, 0, kvs.length)
+    newKvs(index) = entry(key, value)
+    new ImmutableIntMap(newKvs)
   }
 
-  def remove(key: Int): ImmutableIntMap = {
-    val i = Arrays.binarySearch(keys, key)
+  private[this] final def insert(key: Int, value: Int, index: Int): ImmutableIntMap = {
+    // insert the entry at the right position—keep the array sorted
+    val at = -(index + 1)
+    val newKvs = new Array[Long](size + 1)
+    System.arraycopy(kvs, 0, newKvs, 0, at)
+    newKvs(at) = entry(key, value)
+    System.arraycopy(kvs, at, newKvs, at + 1, kvs.length - at)
+    new ImmutableIntMap(newKvs)
+  }
+
+  final def remove(key: Int): ImmutableIntMap = {
+    val i = indexForKey(key)
     if (i >= 0) {
       if (size == 1)
         ImmutableIntMap.empty
       else {
-        val newKeys = new Array[Int](size - 1)
-        System.arraycopy(keys, 0, newKeys, 0, i)
-        System.arraycopy(keys, i + 1, newKeys, i, keys.length - i - 1)
-
-        val newValues = new Array[Int](size - 1)
-        System.arraycopy(values, 0, newValues, 0, i)
-        System.arraycopy(values, i + 1, newValues, i, values.length - i - 1)
-
-        new ImmutableIntMap(newKeys, newValues)
+        val newKvs = new Array[Long](size - 1)
+        System.arraycopy(kvs, 0, newKvs, 0, i)
+        System.arraycopy(kvs, i + 1, newKvs, i, size - i - 1)
+        new ImmutableIntMap(newKvs)
       }
     } else
       this
@@ -109,29 +116,27 @@ import scala.annotation.tailrec
   /**
    * All keys
    */
-  def keysIterator: Iterator[Int] =
-    keys.iterator
+  final def keysIterator: Iterator[Int] = kvs.iterator.map(keyFromEntry)
 
-  override def toString: String =
-    keysIterator.map(key ⇒ s"$key -> ${get(key)}").mkString("ImmutableIntMap(", ", ", ")")
+  override final def toString: String =
+    kvs.iterator.map({
+      e ⇒ s"${keyFromEntry(e)} -> ${valueFromEntry(e)}"
+    }).mkString("ImmutableIntMap(", ", ", ")")
 
-  override def hashCode: Int = {
+  override final def hashCode: Int = {
     var result = HashCode.SEED
-    result = HashCode.hash(result, keys)
-    result = HashCode.hash(result, values)
+    result = HashCode.hash(result, kvs)
     result
   }
 
-  override def equals(obj: Any): Boolean = obj match {
+  override final def equals(obj: Any): Boolean = obj match {
     case other: ImmutableIntMap ⇒
       if (other eq this) true
       else if (size != other.size) false
-      else if (size == 0 && other.size == 0) true
       else {
         @tailrec def check(i: Int): Boolean = {
           if (i < 0) true
-          else if (keys(i) == other.keys(i) && values(i) == other.values(i))
-            check(i - 1) // recur, next elem
+          else if (kvs(i) == other.kvs(i)) check(i - 1)
           else false
         }
         check(size - 1)
